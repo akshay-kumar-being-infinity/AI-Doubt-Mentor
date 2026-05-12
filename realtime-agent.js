@@ -33,10 +33,16 @@ function saveTrackedPid(pid) {
 }
 
 // ==========================================
-// 2. HARDCODED START TIME (May 2, 2026, 2:12 PM IST)
+// 1.5 THE TOPIC STATE CACHE (RAM)
+// ==========================================
+// This remembers the last time we checked a topic so we don't fetch it twice
+const topicCache = {}; 
+
+// ==========================================
+// 2. HARDCODED START TIME
 // ==========================================
 // The bot will strictly ignore any topic activity older than this timestamp
-const START_TIME_MS = new Date('2026-05-02T14:12:00+05:30').getTime();
+const START_TIME_MS = new Date('2026-05-12T16:14:40+05:30').getTime();
 
 // ==========================================
 // 3. THE REAL-TIME POLLING ENGINE
@@ -45,24 +51,57 @@ async function pollForum() {
     console.log(`\n[${new Date().toLocaleTimeString()}] 🔄 Scanning for new activity...`);
     
     try {
-        const catRes = await axios.get(`${forumUrl}/api/category/5?_=${Date.now()}`, {
-            headers: { 'Cookie': forumCookie }
-        });
-        
-        if (!catRes.data.topics) return;
-        const recentTopics = catRes.data.topics.slice(0, 15);
+        let allRecentTopics = [];
+        let page = 1;
+        let keepScanning = true;
 
-        for (const topic of recentTopics) {
+        while (keepScanning) {
+            console.log(`   📄 Fetching page ${page} of the forum...`);
+            const catRes = await axios.get(`${forumUrl}/api/category/5?page=${page}&_=${Date.now()}`, {
+                headers: { 'Cookie': forumCookie }
+            });
+            
+            if (!catRes.data.topics || catRes.data.topics.length === 0) {
+                break; // No more topics, stop scanning
+            }
+
+            for (const topic of catRes.data.topics) {
+                const lastActivity = topic.lastposttime || topic.timestamp;
+                
+                // If we hit a topic older than our hardcoded start time, we can stop scanning older pages!
+                if (lastActivity < START_TIME_MS) {
+                    keepScanning = false; 
+                    continue; 
+                }
+                
+                allRecentTopics.push(topic);
+            }
+            page++;
+        }
+
+        console.log(`   🎯 Found ${allRecentTopics.length} active topics since the cutoff time.`);
+
+        // Now process every single topic we found
+        for (const topic of allRecentTopics) {
             // FILTER 1: Is the topic solved?
             const isSolved = topic.tags && topic.tags.some(tag => tag.value.toLowerCase() === 'solved');
             if (isSolved) continue; 
 
-            // FILTER 2: Is the activity NEWER than our hardcoded start time?
             const lastActivity = topic.lastposttime || topic.timestamp;
-            if (lastActivity < START_TIME_MS) {
-                continue; // Skip it. It's an old doubt.
+
+            // ==========================================
+            // THE BRILLIANT CACHE FILTER
+            // ==========================================
+            // If we have seen this topic before, and its last activity time is exactly the same, 
+            // it means nobody has replied since we last checked. Skip it instantly!
+            if (topicCache[topic.tid] === lastActivity) {
+                continue; 
             }
 
+            // We are about to check this topic. Save its activity time to our cache.
+            topicCache[topic.tid] = lastActivity;
+
+            // ... Now we make the heavy API call, because we know something changed!
             const topicRes = await axios.get(`${forumUrl}/api/topic/${topic.tid}?_=${Date.now()}`, {
                 headers: { 'Cookie': forumCookie }
             });
@@ -70,8 +109,12 @@ async function pollForum() {
             const posts = topicRes.data.posts;
             const lastPost = posts[posts.length - 1]; 
             
+            // FILTER 2: Only reply if the last message is from the student
+            if (lastPost.user && lastPost.user.username !== 'mp-nbb-bot') {
+                continue; 
+            }
+            
             // FILTER 3: The Double-Ledger Check
-            // If the newest PID is in our DB (either it's a student we answered, or our own reply), skip!
             const trackedPids = getTrackedPids();
             if (trackedPids.includes(lastPost.pid)) {
                 continue; 
@@ -87,7 +130,7 @@ async function pollForum() {
             const idMatch = mainPostContent.match(/viewSubmission\/([a-f0-9]+)/);
             if (!idMatch) {
                 console.log(`   ⏩ No Mentorpick submission link found. Skipping...`);
-                saveTrackedPid(lastPost.pid); // Log it so we stop checking it
+                saveTrackedPid(lastPost.pid);
                 continue;
             }
             const submissionId = idMatch[1];
@@ -121,7 +164,7 @@ async function pollForum() {
                 chatHistory += `Message ${index + 1}:\n${cleanText}\n\n`;
             });
 
-            // 4. Your Exact Prompt (with history safely appended at the bottom)
+            // 4. Your Exact Prompt
             console.log(`   🧠 Waking up Gemini to analyze code...`);
             const prompt = `You are a brilliant, empathetic Senior Developer mentoring a junior developer on a coding forum.
 
@@ -177,10 +220,14 @@ Write your response now based on the final message in the Thread History.`;
                     aiResponseText = geminiResponse.data.candidates[0].content.parts[0].text;
                     break;
                 } catch (err) {
-                    if (err.response && err.response.status === 503) {
-                        if (attempt === 3) throw new Error("Gemini API overloaded.");
-                        await new Promise(resolve => setTimeout(resolve, 5000));
-                    } else throw err;
+                    const status = err.response ? err.response.status : null;
+                    if (status === 429 || status === 503) {
+                        console.log(`   ⚠️ Gemini API Limit hit (${status}). Pausing for 15 seconds... (Attempt ${attempt}/3)`);
+                        if (attempt === 3) throw new Error(`Gemini API Failed after 3 retries. Status: ${status}`);
+                        await new Promise(resolve => setTimeout(resolve, 8000));
+                    } else {
+                        throw err; 
+                    }
                 }
             }
 
@@ -205,18 +252,14 @@ Write your response now based on the final message in the Thread History.`;
 
             if (replyRes.status === 200) {
                 console.log(`   ✅ Success! Reply posted.`);
-                
-                // YOUR BRILLIANT FIX: Save the student's PID *and* the AI's newly generated PID
                 saveTrackedPid(lastPost.pid); 
                 if (replyRes.data && replyRes.data.response && replyRes.data.response.pid) {
                     saveTrackedPid(replyRes.data.response.pid);
                 }
-                
             } else {
                 console.log(`   ⚠️ Forum rejected the post. Status: ${replyRes.status}`);
             }
 
-            // Wait 5 seconds between answering doubts to respect rate limits
             await new Promise(resolve => setTimeout(resolve, 5000));
         }
 
@@ -229,7 +272,7 @@ Write your response now based on the final message in the Thread History.`;
 // 4. START THE ASYNC ENGINE
 // ==========================================
 async function runBot() {
-    console.log("🚀 Starting Real-Time Conversational Agent (Filtering data prior to May 2, 2:12 PM)...");
+    console.log("🚀 Starting Real-Time Conversational Agent...");
     
     while (true) {
         await pollForum();
