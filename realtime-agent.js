@@ -9,6 +9,16 @@ const forumCookie = process.env.FORUM_COOKIE;
 const apiCookie = process.env.MENTORPICK_API_COOKIE;
 const geminiKey = process.env.GEMINI_API_KEY;
 
+// PARSE TARGET TAGS
+const rawTags = process.env.TARGET_TAGS || "";
+const TARGET_TAGS_ARRAY = rawTags.split(',').map(tag => tag.trim().toLowerCase()).filter(tag => tag.length > 0);
+
+if (TARGET_TAGS_ARRAY.length > 0) {
+    console.log(`🎯 Bot is in TARGETED MODE. Only answering tags: [${TARGET_TAGS_ARRAY.join(', ')}]`);
+} else {
+    console.log(`🌐 Bot is in GLOBAL MODE. Answering all doubts.`);
+}
+
 // 1. THE SELF-AWARE TRACKER (Local DB)
 const DB_FILE = path.join(__dirname, 'ai-replies.json');
 
@@ -34,7 +44,7 @@ function saveTrackedPid(pid) {
 const topicCache = {}; 
 
 // 2. HARDCODED START TIME
-const START_TIME_MS = new Date('2026-05-13T10:45:40+05:30').getTime();
+const START_TIME_MS = new Date('2026-05-15T09:00:00+05:30').getTime();
 
 // 3. THE REAL-TIME POLLING ENGINE
 async function pollForum() {
@@ -67,9 +77,24 @@ async function pollForum() {
         console.log(`   🎯 Found ${allRecentTopics.length} active topics since the cutoff time.`);
 
         for (const topic of allRecentTopics) {
+            // FILTER 1: 
             const isSolved = topic.tags && topic.tags.some(tag => tag.value.toLowerCase() === 'solved');
             if (isSolved) continue; 
 
+            // FILTER 2: TARGET TAGS MATCHER
+            if (TARGET_TAGS_ARRAY.length > 0) {
+                // Get all the tags attached to this specific topic
+                const topicTags = topic.tags ? topic.tags.map(t => t.value.toLowerCase()) : [];
+                
+                // Check if there is an intersection between the topic's tags and our target tags
+                const hasTargetTag = topicTags.some(tag => TARGET_TAGS_ARRAY.includes(tag));
+                
+                if (!hasTargetTag) {
+                    continue; // Skip this topic, it doesn't have the tags we are looking for
+                }
+            }
+
+            // FILTER 3:
             const lastActivity = topic.lastposttime || topic.timestamp;
 
             if (topicCache[topic.tid] === lastActivity) continue; 
@@ -84,7 +109,7 @@ async function pollForum() {
             
             if (lastPost.user && lastPost.user.username !== 'mp-nbb-bot') continue; 
             
-            // FILTER 3: The Double-Ledger Check
+            // FILTER 4: The Double-Ledger Check
             const trackedPids = getTrackedPids();
             if (trackedPids.includes(lastPost.pid)) continue; 
 
@@ -176,7 +201,7 @@ SCENARIO C: This is a BRAND NEW doubt.
 - Give a high-level conceptual hint based on the system error and their code. 
 
 GLOBAL RULES FOR ALL REPLIES:
-1. SAFE FORMATTING: You MAY use standard Markdown for code formatting. Use backticks for variable names/short snippets (e.g., \`int x = 0;\`). Use **bolding** for emphasis. You must ABSOLUTELY AVOID LaTeX, Markdown math, or special math symbols ($x$, $$, \\( \\)) as they will break the forum UI.
+1. SAFE FORMATTING: You MUST wrap inline variables, array names, and time complexities in Markdown backticks (e.g., \`a\`, \`array N\`, \`O(N)\`). You are strictly forbidden from using LaTeX dollar signs (e.g., NEVER write $a$, $$, or \\( \\)). The forum UI will crash if you use dollar signs.
 2. LENGTH LIMIT: Keep it punchy. Maximum 1 to 3 short sentences.
 3. NO SPOILERS: Never write the corrected code snippet. Guide them to the "aha!" moment.`;
 
@@ -189,6 +214,7 @@ GLOBAL RULES FOR ALL REPLIES:
                         contents: [{ parts: [{ text: prompt }] }]
                     }, { headers: { 'Content-Type': 'application/json' } });
                     aiResponseText = geminiResponse.data.candidates[0].content.parts[0].text;
+                    aiResponseText = aiResponseText.replace(/\$(.*?)\$/g, '`$1`');
                     break;
                 } catch (err) {
                     const status = err.response ? err.response.status : null;
